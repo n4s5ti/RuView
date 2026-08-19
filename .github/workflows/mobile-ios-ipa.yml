@@ -27,7 +27,7 @@ concurrency:
 
 jobs:
   ipa:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 75
     defaults:
       run:
@@ -35,8 +35,8 @@ jobs:
     env:
       CI: '1'
       EXPO_NO_TELEMETRY: '1'
+      EXPO_NO_GIT_STATUS: '1'
       CONFIGURATION: ${{ inputs.configuration || 'Release' }}
-
     steps:
       - uses: actions/checkout@v5
 
@@ -73,7 +73,7 @@ jobs:
           scheme="${workspace%.xcworkspace}"
           echo "scheme=$scheme" >> "$GITHUB_OUTPUT"
           echo "workspace=$workspace scheme=$scheme"
-          ls ios
+          xcodebuild -workspace "ios/$workspace" -list
 
       - name: Archive (code signing disabled)
         run: |
@@ -91,6 +91,7 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
             EXPANDED_CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
             ONLY_ACTIVE_ARCH=NO
 
       - name: Package unsigned IPA
