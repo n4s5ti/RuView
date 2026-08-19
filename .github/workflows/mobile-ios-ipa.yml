@@ -1,0 +1,161 @@
+name: mobile-ios-ipa
+
+# Builds an unsigned iOS .ipa for the Expo app in ui/mobile.
+# Unsigned output is installable only after re-signing (Sideloadly / signing tools);
+# supply signing assets and switch the export step when a paid Apple team is available.
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Xcode build configuration
+        type: choice
+        default: Release
+        options: [Release, Debug]
+  push:
+    branches: [main]
+    paths:
+      - 'ui/mobile/**'
+      - '.github/workflows/mobile-ios-ipa.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    runs-on: macos-15
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: ui/mobile
+    env:
+      CI: '1'
+      EXPO_NO_TELEMETRY: '1'
+      CONFIGURATION: ${{ inputs.configuration || 'Release' }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain versions
+        run: |
+          sw_vers
+          xcodebuild -version
+          ls /Applications | grep -i '^Xcode' || true
+          pod --version
+          ruby --version
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ui/mobile/package-lock.json
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Expo prebuild (generate ios/)
+        run: npx expo prebuild --platform ios --no-install --clean
+
+      - name: CocoaPods install
+        working-directory: ui/mobile/ios
+        run: pod install --repo-update
+
+      - name: Resolve workspace and scheme
+        id: xc
+        run: |
+          set -euo pipefail
+          workspace="$(cd ios && ls -d *.xcworkspace | head -1)"
+          echo "workspace=$workspace" >> "$GITHUB_OUTPUT"
+          scheme="${workspace%.xcworkspace}"
+          echo "scheme=$scheme" >> "$GITHUB_OUTPUT"
+          echo "workspace=$workspace scheme=$scheme"
+          ls ios
+
+      - name: Archive (code signing disabled)
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -workspace "ios/${{ steps.xc.outputs.workspace }}" \
+            -scheme "${{ steps.xc.outputs.scheme }}" \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/RuViewMobile.xcarchive" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            ONLY_ACTIVE_ARCH=NO
+
+      - name: Package unsigned IPA
+        id: pack
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/RuViewMobile.xcarchive"
+          app="$(ls -d "$archive"/Products/Applications/*.app | head -1)"
+          out="$RUNNER_TEMP/ipa"
+          rm -rf "$out" && mkdir -p "$out/Payload"
+          cp -R "$app" "$out/Payload/"
+          name="$(basename "$app" .app)"
+          (cd "$out" && zip -qry "$name-unsigned.ipa" Payload)
+          ipa="$out/$name-unsigned.ipa"
+          echo "ipa=$ipa" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          ls -lh "$ipa"
+
+      - name: Verify IPA contents
+        run: |
+          set -euo pipefail
+          ipa='${{ steps.pack.outputs.ipa }}'
+          app_plist="$RUNNER_TEMP/ipa/Payload/${{ steps.pack.outputs.name }}.app/Info.plist"
+          bundle_id="$(plutil -extract CFBundleIdentifier raw "$app_plist")"
+          version="$(plutil -extract CFBundleShortVersionString raw "$app_plist")"
+          sdk="$(plutil -extract DTPlatformName raw "$app_plist")"
+          min_os="$(plutil -extract MinimumOSVersion raw "$app_plist")"
+          binary="$RUNNER_TEMP/ipa/Payload/${{ steps.pack.outputs.name }}.app/${{ steps.pack.outputs.name }}"
+          archs="$(lipo -archs "$binary")"
+          sha="$(shasum -a 256 "$ipa" | cut -d' ' -f1)"
+          size="$(du -h "$ipa" | cut -f1)"
+          test -f "$RUNNER_TEMP/ipa/Payload/${{ steps.pack.outputs.name }}.app/main.jsbundle" \
+            && jsbundle=present || jsbundle=absent
+          codesign -dv "$RUNNER_TEMP/ipa/Payload/${{ steps.pack.outputs.name }}.app" 2>&1 | head -5 || true
+          {
+            echo "## Unsigned iOS IPA"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| bundle id | \`$bundle_id\` |"
+            echo "| version | $version |"
+            echo "| platform | $sdk (min iOS $min_os) |"
+            echo "| architectures | $archs |"
+            echo "| JS bundle | $jsbundle |"
+            echo "| size | $size |"
+            echo "| sha256 | \`$sha\` |"
+            echo "| signing | none (re-sign before install) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruview-mobile-unsigned-ipa
+          path: ${{ steps.pack.outputs.ipa }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload xcodebuild logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-diagnostics
+          path: |
+            ui/mobile/ios/Podfile.lock
+            /Users/runner/Library/Logs/gym
+            ${{ runner.temp }}/*.xcarchive/Info.plist
+          if-no-files-found: ignore
+          retention-days: 7
